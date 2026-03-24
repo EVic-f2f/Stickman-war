@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>World Map (Remade Local + Fast)</title>
+  <style>
+    body { margin: 0; background: #0b1220; color: #eef3ff; font-family: system-ui, sans-serif; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 1rem; }
+    canvas { width: 100%; height: auto; border: 1px solid rgba(255,255,255,.2); border-radius: 10px; background:#0e1c35; display:block; touch-action:none; }
+    .panel { margin-bottom: .8rem; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h3 style="margin:.2rem 0">World Map (Remade, No Internet)</h3>
+    <div id="status">Loading local data...</div>
+  </div>
+  <canvas id="map" width="1200" height="600"></canvas>
+</div>
+<script>
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+const W = canvas.width;
+const H = canvas.height;
+
+const state = {
+  countries: [],
+  paths: [],
+  graph: new Map(),
+  edgeMap: new Map(),
+  nodeCenters: new Map(),
+  selectedIso: null,
+  currentIso: null,
+  npcLonLat: [0, 0],
+  activeRoutePoints: [],
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  dragging: false,
+  dragStart: [0, 0],
+};
+
+const project = ([lon, lat]) => [((lon + 180) / 360) * W, ((90 - lat) / 180) * H];
+const unprojectScreenToWorld = (x, y) => [(x - state.panX) / state.zoom, (y - state.panY) / state.zoom];
+const edgeKey = (a,b) => [a,b].sort().join('|');
+
+function countryIso(f){return (f?.properties?.iso2 || f?.properties?.ISO_A2 || f?.properties?.iso_a2 || '').toUpperCase();}
+function countryName(f){return f?.properties?.name || f?.properties?.ADMIN || 'Unknown';}
+
+function ringPath2D(ring){
+  const p = new Path2D();
+  ring.forEach((pt, i) => {
+    const [x,y]=project(pt);
+    if(i===0) p.moveTo(x,y); else p.lineTo(x,y);
+  });
+  p.closePath();
+  return p;
+}
+
+function geometryPath2D(geometry){
+  const p = new Path2D();
+  if(!geometry) return p;
+  if(geometry.type==='Polygon') {
+    geometry.coordinates.forEach(r=>p.addPath(ringPath2D(r)));
+  } else if(geometry.type==='MultiPolygon') {
+    geometry.coordinates.forEach(poly=>poly.forEach(r=>p.addPath(ringPath2D(r))));
+  }
+  return p;
+}
+
+function centroid(geometry){
+  if(!geometry) return [0,0];
+  if(geometry.type==='Point') return geometry.coordinates;
+  const ring = geometry.type==='Polygon' ? geometry.coordinates[0] : geometry.coordinates?.[0]?.[0];
+  if(!ring || !ring.length) return [0,0];
+  let sx=0, sy=0, n=Math.max(1, ring.length-1);
+  for(let i=0;i<n;i++){sx+=ring[i][0]; sy+=ring[i][1];}
+  return [sx/n, sy/n];
+}
+
+function buildGraph(pathFeatures){
+  const g = new Map();
+  const eMap = new Map();
+  for(const f of pathFeatures){
+    const a=(f.properties.fromIso||'').toUpperCase();
+    const b=(f.properties.toIso||'').toUpperCase();
+    if(!a||!b) continue;
+    const w=Number(f.properties.distance||1) + (f.properties.mode==='ship'?10:0);
+    if(!g.has(a)) g.set(a,[]); if(!g.has(b)) g.set(b,[]);
+    g.get(a).push({to:b,w,f}); g.get(b).push({to:a,w,f});
+    eMap.set(edgeKey(a,b),f);
+    if(!state.nodeCenters.has(a)) state.nodeCenters.set(a, f.geometry.coordinates[0]);
+    if(!state.nodeCenters.has(b)) state.nodeCenters.set(b, f.geometry.coordinates[2]);
+  }
+  state.graph=g; state.edgeMap=eMap;
+}
+
+function nearestIso(center){
+  let best=null, bd=Infinity;
+  for(const [iso,p] of state.nodeCenters){
+    const dx=center[0]-p[0], dy=center[1]-p[1];
+    const d=Math.hypot(dx,dy);
+    if(d<bd){bd=d;best=iso;}
+  }
+  return best;
+}
+
+function shortest(start,end){
+  if(start===end) return [start];
+  const d=new Map(), prev=new Map(), un=new Set(state.graph.keys());
+  for(const n of un)d.set(n,Infinity); d.set(start,0);
+  while(un.size){
+    let cur=null, best=Infinity;
+    for(const n of un){const v=d.get(n); if(v<best){best=v;cur=n;}}
+    if(cur===null||best===Infinity) break;
+    un.delete(cur); if(cur===end) break;
+    for(const e of state.graph.get(cur)||[]){
+      if(!un.has(e.to)) continue;
+      const alt=d.get(cur)+e.w;
+      if(alt<d.get(e.to)){d.set(e.to,alt); prev.set(e.to,cur);} 
+    }
+  }
+  if(!prev.has(end)) return null;
+  const path=[end]; let n=end;
+  while(n!==start){n=prev.get(n); if(!n) return null; path.push(n);} 
+  return path.reverse();
+}
+
+function routeToPoints(route){
+  const out=[];
+  for(let i=0;i<route.length-1;i++){
+    const f=state.edgeMap.get(edgeKey(route[i],route[i+1]));
+    if(!f) continue;
+    let c=f.geometry.coordinates;
+    if((f.properties.fromIso||'').toUpperCase()!==route[i]) c=[...c].reverse();
+    if(i===0) out.push(c[0]);
+    out.push(c[2]);
+  }
+  return out;
+}
+
+function animateNpc(points){
+  if(points.length<2) return;
+  const path=[];
+  for(let i=0;i<points.length;i++) path.push(project(points[i]));
+  const dist=[0];
+  for(let i=1;i<path.length;i++) dist.push(dist[i-1]+Math.hypot(path[i][0]-path[i-1][0], path[i][1]-path[i-1][1]));
+  const total=dist[dist.length-1];
+  if(total<=0) return;
+
+  const start=performance.now();
+  const dur=1400;
+  function step(t){
+    const u=Math.min(1,(t-start)/dur);
+    const s=u*total;
+    let seg=1; while(seg<dist.length && dist[seg]<s) seg++;
+    const a=path[Math.max(0,seg-1)], b=path[Math.min(path.length-1,seg)];
+    const da=dist[Math.max(0,seg-1)], db=dist[Math.min(dist.length-1,seg)]||da+1;
+    const k=(s-da)/Math.max(1e-6,db-da);
+    const x=a[0]+(b[0]-a[0])*k, y=a[1]+(b[1]-a[1])*k;
+    state.npcLonLat=[(x/W)*360-180, 90-(y/H)*180];
+    draw();
+    if(u<1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,W,H);
+  ctx.setTransform(state.zoom,0,0,state.zoom,state.panX,state.panY);
+
+  for(const c of state.countries){
+    ctx.fillStyle = c.iso===state.selectedIso ? 'rgba(255,209,102,.8)' : 'rgba(126,200,255,.45)';
+    ctx.strokeStyle = '#7ec8ff'; ctx.lineWidth = 1/state.zoom;
+    ctx.fill(c.path); ctx.stroke(c.path);
+  }
+
+  if(state.activeRoutePoints.length>1){
+    ctx.strokeStyle = '#ff8fab';
+    ctx.lineWidth = 2.2/state.zoom;
+    ctx.beginPath();
+    state.activeRoutePoints.forEach((pt,i)=>{const [x,y]=project(pt); if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);});
+    ctx.stroke();
+  }
+
+  const [nx,ny]=project(state.npcLonLat);
+  ctx.fillStyle='#90ee90';
+  ctx.beginPath(); ctx.arc(nx,ny,6/state.zoom,0,Math.PI*2); ctx.fill();
+}
+
+function pickCountry(worldX, worldY){
+  for(let i=state.countries.length-1;i>=0;i--){
+    if(ctx.isPointInPath(state.countries[i].path, worldX, worldY)) return state.countries[i];
+  }
+  return null;
+}
+
+async function init(){
+  const [countries, paths] = await Promise.all([
+    fetch('../data/countries.geojson').then(r=>r.json()),
+    fetch('../data/npc_paths.geojson').then(r=>r.json())
+  ]);
+
+  state.countries = countries.features.map(f=>({
+    feature:f,
+    iso: countryIso(f),
+    name: countryName(f),
+    center: centroid(f.geometry),
+    path: geometryPath2D(f.geometry),
+  }));
+
+  buildGraph(paths.features);
+  state.currentIso = state.graph.has('LY') ? 'LY' : Array.from(state.graph.keys())[0];
+  state.npcLonLat = state.nodeCenters.get(state.currentIso) || [0,0];
+  statusEl.textContent = `Ready. NPC start: ${state.currentIso}. Click a country.`;
+  draw();
+}
+
+canvas.addEventListener('click', (e)=>{
+  const rect=canvas.getBoundingClientRect();
+  const sx=(e.clientX-rect.left)*(W/rect.width);
+  const sy=(e.clientY-rect.top)*(H/rect.height);
+  const [wx,wy]=unprojectScreenToWorld(sx,sy);
+  const picked=pickCountry(wx,wy);
+  if(!picked) return;
+
+  state.selectedIso=picked.iso;
+  const targetIso = (picked.iso && state.graph.has(picked.iso)) ? picked.iso : nearestIso(picked.center);
+  const route = shortest(state.currentIso, targetIso);
+  if(!route){ statusEl.textContent=`No route to ${picked.name}`; draw(); return; }
+  state.activeRoutePoints = routeToPoints(route);
+  state.currentIso = targetIso;
+  statusEl.textContent = `NPC: ${route.join(' → ')}`;
+  animateNpc(state.activeRoutePoints);
+});
+
+canvas.addEventListener('wheel',(e)=>{
+  e.preventDefault();
+  const rect=canvas.getBoundingClientRect();
+  const sx=(e.clientX-rect.left)*(W/rect.width), sy=(e.clientY-rect.top)*(H/rect.height);
+  const k=Math.exp(-e.deltaY*0.0025);
+  const nz=Math.max(0.6,Math.min(8,state.zoom*k));
+  state.panX = sx - ((sx - state.panX) * (nz/state.zoom));
+  state.panY = sy - ((sy - state.panY) * (nz/state.zoom));
+  state.zoom = nz;
+  draw();
+},{passive:false});
+
+canvas.addEventListener('pointerdown',(e)=>{state.dragging=true; state.dragStart=[e.clientX-state.panX,e.clientY-state.panY]; canvas.setPointerCapture(e.pointerId);});
+canvas.addEventListener('pointermove',(e)=>{if(!state.dragging)return; state.panX=e.clientX-state.dragStart[0]; state.panY=e.clientY-state.dragStart[1]; draw();});
+canvas.addEventListener('pointerup',(e)=>{state.dragging=false; canvas.releasePointerCapture(e.pointerId);});
+canvas.addEventListener('dblclick',()=>{state.zoom=1; state.panX=0; state.panY=0; draw();});
+
+init().catch(err=>statusEl.textContent=`Failed: ${err.message}`);
+</script>
+</body>
+</html>
